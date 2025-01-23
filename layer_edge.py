@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import asyncio
 import time
 import traceback
@@ -6,7 +5,9 @@ from web3.auto import w3
 from eth_account.messages import encode_defunct
 import aiohttp
 
-
+# -------------------------------------------------------------------
+# HARDCODED CONFIG
+# -------------------------------------------------------------------
 BASE_URL        = "https://dashboard.layeredge.io"  # The main domain
 WALLET_ADDRESS  = "address"
 PRIVATE_KEY     = "key"
@@ -17,6 +18,7 @@ POLL_INTERVAL   = 5   # seconds
 PROXY_FILE      = "proxy_list.txt"  # file with one http-proxy per line
 TIMEOUT_SECS    = 15
 
+
 def sign_message(message: str, private_key: str) -> str:
     """
     Signs the given message (Ethereum-style) and returns a hex signature.
@@ -24,6 +26,7 @@ def sign_message(message: str, private_key: str) -> str:
     msg_hash = encode_defunct(text=message)
     signed   = w3.eth.account.sign_message(msg_hash, private_key=private_key)
     return signed.signature.hex()
+
 
 async def start_node(session: aiohttp.ClientSession, proxy_str: str):
     """
@@ -43,20 +46,23 @@ async def start_node(session: aiohttp.ClientSession, proxy_str: str):
 
     payload = {
         "walletAddress": WALLET_ADDRESS
+        # If needed, you can include "signature": signature
     }
-
     url = f"{BASE_URL}{START_ENDPOINT}"
     print(f"[Proxy {proxy_str}] [*] Sending node start request: {url}")
 
     try:
-        async with session.post(url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS) as resp:
+        async with session.post(
+            url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS
+        ) as resp:
             text = await resp.text()
             print(f"[Proxy {proxy_str}] [start_node] Status code: {resp.status}")
             print(f"[Proxy {proxy_str}] [start_node] Response   : {text}")
+
             if resp.status != 200:
+                # Non-200 => just return None so caller can handle
                 return None
 
-            data = {}
             try:
                 data = await resp.json()
             except Exception:
@@ -73,6 +79,7 @@ async def start_node(session: aiohttp.ClientSession, proxy_str: str):
         traceback.print_exc()
         return None
 
+
 async def farm_loop(session: aiohttp.ClientSession, proxy_str: str, last_start_time: int):
     """
     Infinite loop sending POST to /api/node-points every POLL_INTERVAL seconds.
@@ -84,21 +91,22 @@ async def farm_loop(session: aiohttp.ClientSession, proxy_str: str, last_start_t
     while True:
         try:
             payload = {
-                "walletAddress": WALLET_ADDRESS,
-                "lastStartTime": last_start_time
+                "walletAddress":  WALLET_ADDRESS,
+                "lastStartTime":  last_start_time
             }
-            async with session.post(url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS) as resp:
+            async with session.post(
+                url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS
+            ) as resp:
                 text = await resp.text()
                 print(f"[Proxy {proxy_str}] [FARM] {time.strftime('%Y-%m-%d %H:%M:%S')} -> "
                       f"Status code: {resp.status}")
                 print(f"[Proxy {proxy_str}] [FARM] Response           : {text}")
 
                 if resp.status != 200:
-                    # Non-200 => skip processing
+                    # Non-200 => skip further processing
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                data = {}
                 try:
                     data = await resp.json()
                 except Exception:
@@ -118,24 +126,30 @@ async def farm_loop(session: aiohttp.ClientSession, proxy_str: str, last_start_t
 
         await asyncio.sleep(POLL_INTERVAL)
 
+
 async def worker(proxy_str: str):
     """
     Single proxy worker:
     1) Attempt to start node (get lastStartTime).
-    2) If success, loop forever in farm_loop.
+    2) If it fails or returns no last_start_time, we still continue farming with lastStartTime=0.
+    3) Enters the infinite farm_loop.
     """
     async with aiohttp.ClientSession() as session:
         start_data = await start_node(session, proxy_str)
-        if not start_data:
-            print(f"[Proxy {proxy_str}] [!] start_node() returned no valid data; stopping worker.")
-          
 
-        last_start_time = start_data.get("lastStartTime")
-        if last_start_time is None:
-            print(f"[Proxy {proxy_str}] [!] No lastStartTime in start_node() response; stopping worker.")
+        if start_data is None:
+            print(f"[Proxy {proxy_str}] [!] start_node() gave no data; continuing with lastStartTime=0.")
+            last_start_time = 0
+        else:
+            # If it did return data, we try to grab lastStartTime
+            last_start_time = start_data.get("lastStartTime", 0)
+            if last_start_time is None:
+                print(f"[Proxy {proxy_str}] [!] start_node() had no lastStartTime; using 0 anyway.")
+                last_start_time = 0
 
-        # Now loop
+        # Now loop even if we have 0
         await farm_loop(session, proxy_str, last_start_time)
+
 
 async def main():
     # Read proxies from file
@@ -164,6 +178,7 @@ async def main():
 
     # Wait for all tasks (they run forever)
     await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     try:
