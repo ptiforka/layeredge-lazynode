@@ -128,12 +128,11 @@ async def worker(proxy_str: str):
         start_data = await start_node(session, proxy_str)
         if not start_data:
             print(f"[Proxy {proxy_str}] [!] start_node() returned no valid data; stopping worker.")
-            return
+          
 
         last_start_time = start_data.get("lastStartTime")
         if last_start_time is None:
             print(f"[Proxy {proxy_str}] [!] No lastStartTime in start_node() response; stopping worker.")
-            return
 
         # Now loop
         await farm_loop(session, proxy_str, last_start_time)
