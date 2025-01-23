@@ -5,17 +5,17 @@ from web3.auto import w3
 from eth_account.messages import encode_defunct
 import aiohttp
 
-# -------------------------------------------------------------------
-# HARDCODED CONFIG
-# -------------------------------------------------------------------
-BASE_URL        = "https://dashboard.layeredge.io"  # The main domain
+# ------------------------------------------------------------------------------
+# HARDCODED CONFIG (AS REQUESTED)
+# ------------------------------------------------------------------------------
+BASE_URL        = "https://dashboard.layeredge.io"
 WALLET_ADDRESS  = "address"
 PRIVATE_KEY     = "key"
 
 START_ENDPOINT  = "/api/node-points/start"
 UPDATE_ENDPOINT = "/api/node-points"
-POLL_INTERVAL   = 5   # seconds
-PROXY_FILE      = "proxy_list.txt"  # file with one http-proxy per line
+POLL_INTERVAL   = 5   # seconds between farming attempts
+PROXY_FILE      = "proxy_list.txt"  # one http-proxy per line
 TIMEOUT_SECS    = 15
 
 
@@ -28,11 +28,12 @@ def sign_message(message: str, private_key: str) -> str:
     return signed.signature.hex()
 
 
-async def start_node(session: aiohttp.ClientSession, proxy_str: str):
+async def attempt_start_node(session: aiohttp.ClientSession, proxy_str: str) -> int:
     """
-    1) Create message to sign (for node activation).
-    2) Sign with the private key.
-    3) POST to /api/node-points/start using the given proxy, returning server JSON or None.
+    Attempt to call /api/node-points/start once.
+    If successful, return the lastStartTime from the server.
+    If not, return None or raise an error. 
+    We do NOT loop here; we just do one attempt.
     """
     now_ms = int(time.time() * 1000)
     msg    = f"Node activation request for {WALLET_ADDRESS} at {now_ms}"
@@ -46,109 +47,130 @@ async def start_node(session: aiohttp.ClientSession, proxy_str: str):
 
     payload = {
         "walletAddress": WALLET_ADDRESS
-        # If needed, you can include "signature": signature
+        # If required: "signature": signature
     }
+
     url = f"{BASE_URL}{START_ENDPOINT}"
     print(f"[Proxy {proxy_str}] [*] Sending node start request: {url}")
 
     try:
         async with session.post(
-            url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS
+            url,
+            json=payload,
+            proxy=proxy_str,
+            timeout=TIMEOUT_SECS
         ) as resp:
             text = await resp.text()
             print(f"[Proxy {proxy_str}] [start_node] Status code: {resp.status}")
             print(f"[Proxy {proxy_str}] [start_node] Response   : {text}")
 
+            # If not 200, treat as fail
             if resp.status != 200:
-                # Non-200 => just return None so caller can handle
                 return None
 
+            # Attempt to parse JSON
             try:
                 data = await resp.json()
             except Exception:
-                print(f"[Proxy {proxy_str}] [!] Failed to parse JSON from start_node.")
+                print(f"[Proxy {proxy_str}] [!] Failed to parse JSON.")
                 return None
 
+            # Check success
             if not data.get("success"):
-                print(f"[Proxy {proxy_str}] [!] success=False from start_node. Data: {data}")
+                print(f"[Proxy {proxy_str}] [!] success=False. data: {data}")
                 return None
 
-            return data
+            # Return the lastStartTime
+            return data.get("lastStartTime")
     except Exception as ex:
-        print(f"[Proxy {proxy_str}] [!] Exception in start_node(): {ex}")
+        print(f"[Proxy {proxy_str}] [!] Exception in start_node: {ex}")
         traceback.print_exc()
         return None
 
 
-async def farm_loop(session: aiohttp.ClientSession, proxy_str: str, last_start_time: int):
+async def do_farm_once(
+    session: aiohttp.ClientSession, 
+    proxy_str: str, 
+    last_start_time: int
+) -> bool:
     """
-    Infinite loop sending POST to /api/node-points every POLL_INTERVAL seconds.
-    Uses the same proxy. Logs responses. Runs indefinitely.
+    Perform ONE farming request to /api/node-points using the given lastStartTime.
+    Returns True if the request was successful (status=200, success=True),
+    otherwise False. 
     """
-    print(f"[Proxy {proxy_str}] [*] Entering infinite farm loop.")
     url = f"{BASE_URL}{UPDATE_ENDPOINT}"
+    payload = {
+        "walletAddress":  WALLET_ADDRESS,
+        "lastStartTime":  last_start_time
+    }
 
-    while True:
-        try:
-            payload = {
-                "walletAddress":  WALLET_ADDRESS,
-                "lastStartTime":  last_start_time
-            }
-            async with session.post(
-                url, json=payload, proxy=proxy_str, timeout=TIMEOUT_SECS
-            ) as resp:
-                text = await resp.text()
-                print(f"[Proxy {proxy_str}] [FARM] {time.strftime('%Y-%m-%d %H:%M:%S')} -> "
-                      f"Status code: {resp.status}")
-                print(f"[Proxy {proxy_str}] [FARM] Response           : {text}")
+    try:
+        async with session.post(
+            url, 
+            json=payload, 
+            proxy=proxy_str, 
+            timeout=TIMEOUT_SECS
+        ) as resp:
+            text = await resp.text()
+            now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[Proxy {proxy_str}] [FARM] {now_str} -> Status code: {resp.status}")
+            print(f"[Proxy {proxy_str}] [FARM] Response       : {text}")
 
-                if resp.status != 200:
-                    # Non-200 => skip further processing
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+            if resp.status != 200:
+                return False
 
-                try:
-                    data = await resp.json()
-                except Exception:
-                    print(f"[Proxy {proxy_str}] [!] Could not parse JSON in farm loop.")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+            # Parse JSON
+            try:
+                data = await resp.json()
+            except Exception:
+                print(f"[Proxy {proxy_str}] [!] Could not parse JSON in farm_once.")
+                return False
 
-                if not data.get("success"):
-                    print(f"[Proxy {proxy_str}] [!] success=False. Data: {data}")
-                else:
-                    node_points = data.get("nodePoints", "N/A")
-                    print(f"[Proxy {proxy_str}] [+] Node points: {node_points}")
+            if not data.get("success"):
+                print(f"[Proxy {proxy_str}] [!] success=False. data: {data}")
+                return False
 
-        except Exception as e:
-            print(f"[Proxy {proxy_str}] [!] Exception during farming loop: {e}")
-            traceback.print_exc()
+            # success -> log nodePoints
+            node_points = data.get("nodePoints", "N/A")
+            print(f"[Proxy {proxy_str}] [+] Node points: {node_points}")
+            return True
 
-        await asyncio.sleep(POLL_INTERVAL)
+    except Exception as e:
+        print(f"[Proxy {proxy_str}] [!] Exception in do_farm_once: {e}")
+        traceback.print_exc()
+        return False
 
 
 async def worker(proxy_str: str):
     """
-    Single proxy worker:
-    1) Attempt to start node (get lastStartTime).
-    2) If it fails or returns no last_start_time, we still continue farming with lastStartTime=0.
-    3) Enters the infinite farm_loop.
+    The worker for a single proxy that NEVER stops:
+     - Repeatedly tries to start the node until we get a valid lastStartTime.
+     - Then we do farming requests in a loop.
+       * If a farm request fails, or returns an error code that suggests 
+         we need to re-login (like 400 or "Database error"), 
+         we break out and attempt start_node again.
+    This loop runs forever.
     """
     async with aiohttp.ClientSession() as session:
-        start_data = await start_node(session, proxy_str)
+        while True:
+            # 1) Keep re-trying to start node until we get a lastStartTime
+            last_start_time = None
+            while last_start_time is None:
+                last_start_time = await attempt_start_node(session, proxy_str)
+                if last_start_time is None:
+                    print(f"[Proxy {proxy_str}] [!] start_node failed. Retrying in {POLL_INTERVAL}s...")
+                    await asyncio.sleep(POLL_INTERVAL)
 
-        if start_data is None:
-            print(f"[Proxy {proxy_str}] [!] start_node() gave no data; continuing with lastStartTime=0.")
-            last_start_time = 0
-        else:
-            # If it did return data, we try to grab lastStartTime
-            last_start_time = start_data.get("lastStartTime", 0)
-            if last_start_time is None:
-                print(f"[Proxy {proxy_str}] [!] start_node() had no lastStartTime; using 0 anyway.")
-                last_start_time = 0
-
-        # Now loop even if we have 0
-        await farm_loop(session, proxy_str, last_start_time)
+            print(f"[Proxy {proxy_str}] [*] Got lastStartTime={last_start_time}. Farming loop starts.")
+            
+            # 2) Farming loop
+            while True:
+                success = await do_farm_once(session, proxy_str, last_start_time)
+                if not success:
+                    # If farm request fails, we break and re-start node
+                    print(f"[Proxy {proxy_str}] [!] Farm request failed. Will re-start node.")
+                    break
+                await asyncio.sleep(POLL_INTERVAL)
 
 
 async def main():
